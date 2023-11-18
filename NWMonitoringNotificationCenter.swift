@@ -8,26 +8,47 @@
 
 import Foundation
 
+struct NWMonitoringConfigurator: Identifiable {
+    
+    typealias ID = Int
+    
+    enum NotifyType {
+        case `default`
+        case whenConnectionChanged
+    }
+    
+    static let `default` = NWMonitoringConfigurator(id: .zero, notifyType: .default)
+    
+    var id: ID
+    let notifyType: NotifyType
+    
+    init(id: ID, notifyType: NotifyType) {
+        self.id = id
+        self.notifyType = notifyType
+    }
+    
+}
+
 protocol NWMonitoringObserverProtocol: AnyObject, Sendable {
-    var identifier: AnyHashable { get }
+    var configurator: NWMonitoringConfigurator { get }
     func observe(event: Notification.Name,
-                 monitorManager: NWMonitoringManagerProtocol,
+                 monitorManager: NWMonitoringManager,
                  notificationCenter: NWMonitoringNotificationCenter)
     func observe(event: Notification.Name,
-                 monitorManager: NWMonitoringManagerProtocol,
+                 monitorManager: NWMonitoringManager,
                  notificationCenter: NWMonitoringNotificationCenter) async
 }
 
 extension NWMonitoringObserverProtocol {
     
     func observe(event: Notification.Name,
-                 monitorManager: NWMonitoringManagerProtocol,
+                 monitorManager: NWMonitoringManager,
                  notificationCenter: NWMonitoringNotificationCenter) {
         
     }
     
     func observe(event: Notification.Name,
-                 monitorManager: NWMonitoringManagerProtocol,
+                 monitorManager: NWMonitoringManager,
                  notificationCenter: NWMonitoringNotificationCenter) async {
         
     }
@@ -37,12 +58,13 @@ extension NWMonitoringObserverProtocol {
 protocol NWMonitoringNotificationCenterProtocol: AnyObject, Sendable {
     func add(_ observer: NWMonitoringObserverProtocol, forEvent event: Notification.Name)
     func remove(_ observer: NWMonitoringObserverProtocol, forEvent event: Notification.Name)
-    func post(event: Notification.Name, object: NWMonitoringManagerProtocol)
+    func post(event: Notification.Name, object: NWMonitoringManager)
     func hasObserver(_ observer: NWMonitoringObserverProtocol, forEvent event: Notification.Name) -> Bool
     
+    func asyncInitiate() async
     func addAsync(_ observer: NWMonitoringObserverProtocol, forEvent event: Notification.Name) async
     func removeAsync(_ observer: NWMonitoringObserverProtocol, forEvent event: Notification.Name) async
-    func postAsync(event: Notification.Name, object: NWMonitoringManagerProtocol) async
+    func postAsync(event: Notification.Name, object: NWMonitoringManager) async
     func hasObserverAsync(_ observer: NWMonitoringObserverProtocol, forEvent event: Notification.Name) async -> Bool
 }
 
@@ -51,25 +73,37 @@ fileprivate actor NWMonitoringObserver {
     
     func addObserver(_ observer: NWMonitoringObserverProtocol, forEvent event: Notification.Name) {
         let weakObserver = WeakObserver(observer)
-        observers[event.rawValue, default: [:]][observer.identifier] = weakObserver
+        observers[event.rawValue, default: [:]][observer.configurator.id] = weakObserver
     }
     
     func removeObserver(_ observer: NWMonitoringObserverProtocol, forEvent event: Notification.Name) {
-        observers[event.rawValue]?.removeValue(forKey: observer.identifier)
+        observers[event.rawValue]?.removeValue(forKey: observer.configurator.id)
     }
     
-    func post(forEvent event: Notification.Name, with object: NWMonitoringManagerProtocol) async {
+    func post(forEvent event: Notification.Name, with object: NWMonitoringManager) async {
         guard let values = observers[event.rawValue]?.values else { return }
         
-        for observer in values {
-            await observer.observer?.observe(event: event,
-                                             monitorManager: object,
-                                             notificationCenter: NWMonitoringNotificationCenter.shared)
+        for value in values {
+            guard let observer = value.observer else { return }
+            
+            let notifyType = observer.configurator.notifyType
+            switch notifyType {
+            case .default:
+                await observer.observe(event: event,
+                                       monitorManager: object,
+                                       notificationCenter: NWMonitoringNotificationCenter.shared)
+            case .whenConnectionChanged:
+                if object.connectionChanged {
+                    await observer.observe(event: event,
+                                           monitorManager: object,
+                                           notificationCenter: NWMonitoringNotificationCenter.shared)
+                }
+            }
         }
     }
     
     func hasObserver(_ observer: NWMonitoringObserverProtocol, forEvent event: Notification.Name) -> Bool {
-        return observers[event.rawValue]?.keys.contains(observer.identifier) ?? false
+        return observers[event.rawValue]?.keys.contains(observer.configurator.id) ?? false
     }
 }
 
@@ -81,7 +115,7 @@ final class NWMonitoringNotificationCenter: NWMonitoringNotificationCenterProtoc
     private let observerManager = NWMonitoringObserver()
     private var observers = [String: [AnyHashable: WeakObserver]]()
     private var lock = pthread_rwlock_t()
-    private let networkMonitoringManager: NWMonitoringManagerProtocol = NWMonitoringManager.shared
+    private let networkMonitoringManager = NWMonitoringManager.shared
     
     // MARK: - Life cycle
     
@@ -109,22 +143,32 @@ final class NWMonitoringNotificationCenter: NWMonitoringNotificationCenterProtoc
         pthread_rwlock_wrlock(&lock)
         defer { pthread_rwlock_unlock(&lock) }
         
-        observers[event.rawValue, default: [:]][observer.identifier] = weakObserver
+        observers[event.rawValue, default: [:]][observer.configurator.id] = weakObserver
     }
     
     func remove(_ observer: NWMonitoringObserverProtocol, forEvent event: Notification.Name) {
         pthread_rwlock_wrlock(&lock)
         defer { pthread_rwlock_unlock(&lock) }
         
-        observers[event.rawValue]?.removeValue(forKey: observer.identifier)
+        observers[event.rawValue]?.removeValue(forKey: observer.configurator.id)
     }
     
-    func post(event: Notification.Name, object: NWMonitoringManagerProtocol) {
+    func post(event: Notification.Name, object: NWMonitoringManager) {
         pthread_rwlock_rdlock(&lock)
         defer { pthread_rwlock_unlock(&lock) }
         
         observers[event.rawValue]?.values.forEach {
-            $0.observer?.observe(event: event, monitorManager: object, notificationCenter: self)
+            guard let observer = $0.observer else { return }
+            
+            let notifyType = observer.configurator.notifyType
+            switch notifyType {
+            case .default:
+                observer.observe(event: event, monitorManager: object, notificationCenter: self)
+            case .whenConnectionChanged:
+                if object.connectionChanged {
+                    observer.observe(event: event, monitorManager: object, notificationCenter: self)
+                }
+            }
         }
     }
     
@@ -134,7 +178,7 @@ final class NWMonitoringNotificationCenter: NWMonitoringNotificationCenterProtoc
         pthread_rwlock_rdlock(&lock)
         defer { pthread_rwlock_unlock(&lock) }
         
-        return observers[event.rawValue]?.keys.contains(observer.identifier) ?? false
+        return observers[event.rawValue]?.keys.contains(observer.configurator.id) ?? false
     }
     
     func addAsync(_ observer: NWMonitoringObserverProtocol, forEvent event: Notification.Name) async {
@@ -145,7 +189,7 @@ final class NWMonitoringNotificationCenter: NWMonitoringNotificationCenterProtoc
         await observerManager.removeObserver(observer, forEvent: event)
     }
     
-    func postAsync(event: Notification.Name, object: NWMonitoringManagerProtocol) async {
+    func postAsync(event: Notification.Name, object: NWMonitoringManager) async {
         await observerManager.post(forEvent: event, with: object)
     }
     
